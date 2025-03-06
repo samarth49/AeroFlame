@@ -1,53 +1,90 @@
-from flask import Flask, Response
+from flask import Flask, request, Response
 import cv2
+import os
 from ultralytics import YOLO
 import cvzone
 import math
+import threading
+import time
 
 app = Flask(__name__)
 
 # Load YOLO fire detection model
 model = YOLO("fire.pt")
 
-# Open video file
-cap = cv2.VideoCapture("fire2.mp4")
+# Storage path for uploaded videos
+UPLOAD_FOLDER = "uploads"
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-classnames = ["fire"]
+cap = None  # Global video capture object
+processing = False  # Control flag for video processing
+lock = threading.Lock()  # Ensure thread safety
+
+
+@app.route("/upload", methods=["POST"])
+def upload_video():
+    global cap, processing
+
+    with lock:
+        # Stop any existing video processing
+        processing = False
+        time.sleep(1)  # Give some time for the process to stop
+
+        # Remove previous video before saving new one
+        for file in os.listdir(UPLOAD_FOLDER):
+            os.remove(os.path.join(UPLOAD_FOLDER, file))
+
+        video_file = request.files["file"]
+        video_path = os.path.join(UPLOAD_FOLDER, video_file.filename)
+        video_file.save(video_path)
+
+        # Load new video for processing
+        cap = cv2.VideoCapture(video_path)
+        processing = True  # Start processing the new video
+
+    return {"message": "Video uploaded successfully!"}
+
 
 def generate_frames():
+    global cap, processing
     while True:
-        success, frame = cap.read()
-        if not success:
-            # Reset video capture to loop the video
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            continue  # Skip iteration and retry
+        with lock:
+            if not processing or cap is None:
+                time.sleep(0.1)  # Prevents busy waiting
+                continue
 
-        frame = cv2.resize(frame, (640, 480))
+            success, frame = cap.read()
+            if not success:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Restart video loop
+                continue
 
-        # Perform YOLO inference
-        results = model(frame, stream=True)
+            frame = cv2.resize(frame, (640, 480))
 
-        for info in results:
-            boxes = info.boxes
-            for box in boxes:
-                confidence = math.ceil(box.conf.item() * 100)  # Convert to scalar
-                class_id = int(box.cls.item())  # Convert class index to int
-                if confidence > 50:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])  # Bounding box coordinates
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                    cvzone.putTextRect(frame, f'{classnames[class_id]} {confidence}%', 
-                                       (x1 + 5, y1 - 10), scale=1, thickness=2, colorR=(255, 0, 0))
+            # Perform YOLO inference
+            results = model(frame, stream=True)
 
-        # Encode frame as JPEG
-        _, buffer = cv2.imencode('.jpg', frame)
-        frame = buffer.tobytes()
+            for info in results:
+                boxes = info.boxes
+                for box in boxes:
+                    confidence = math.ceil(box.conf.item() * 100)
+                    class_id = int(box.cls.item())
+                    if confidence > 50:
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
+                        cvzone.putTextRect(frame, f'Fire {confidence}%', 
+                                           (x1 + 5, y1 - 10), scale=1, thickness=2, colorR=(255, 0, 0))
 
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+            _, buffer = cv2.imencode('.jpg', frame)
+            frame = buffer.tobytes()
 
-@app.route('/video_feed')
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+
+
+@app.route("/video_feed")
 def video_feed():
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)  # Disable debug mode to prevent restarts
+    app.run(host="0.0.0.0", port=5000, debug=False)
